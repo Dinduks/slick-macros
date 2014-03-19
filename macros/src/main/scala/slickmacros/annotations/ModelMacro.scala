@@ -183,10 +183,11 @@ object ModelMacro {
       def parseBody(allClasses: List[ClsDesc]) {
         val constraintsTerm = newTermName("constraints")
         val ClassDef(mod, name, Nil, Template(parents, self, body)) = tree
+        println("== " + tree)
         body.foreach {
           it =>
             it match {
-              case ValDef(_, _, _, _) => fields += FldDesc(it, tree, allClasses)
+              case ValDef(_, _, _, _) => fields += FldDesc(it.asInstanceOf[ValDef], tree, allClasses)
               case _ =>
             }
         }
@@ -276,19 +277,23 @@ object ModelMacro {
         new ClsDesc(name.decoded, flags, ListBuffer(), tree, plural(decapitalize(name.decoded)))
       }
     }
-    class FldDesc(val name: String, val colName: String, val typeName: String, val flags: Set[FieldFlag], val dbType: Option[String], val onDelete: String, val onUpdate: String, val cls: Option[ClsDesc], val tree: Tree) {
+
+    class FldDesc(val name: String,
+                  val colName: String,
+                  val typeName: String,
+                  val defaultValue: Option[String],
+                  val flags: Set[FieldFlag],
+                  val dbType: Option[String],
+                  val onDelete: String,
+                  val onUpdate: String,
+                  val cls: Option[ClsDesc],
+                  val tree: Tree) {
       def unique: Boolean = flags.exists(_ == FieldFlag.UNIQUE)
-
       def part: Boolean = flags.exists(_ == FieldFlag.PART)
-
       def option: Boolean = flags.exists(_ == FieldFlag.OPTION)
-
       def cse: Boolean = flags.exists(_ == FieldFlag.CASE)
-
       def pk: Boolean = flags.exists(_ == FieldFlag.PK)
-
       def onDeleteAction = s"scala.slick.lifted.ForeignKeyAction.$onDelete"
-
       def onUpdateAction = s"scala.slick.lifted.ForeignKeyAction.$onUpdate"
     }
 
@@ -320,11 +325,11 @@ object ModelMacro {
     }
 
     object FldDesc {
-      def apply(fieldTree: Tree, clsTree: Tree, allClasses: List[ClsDesc]) = {
+      def apply(fieldTree: ValDef, clsTree: Tree, allClasses: List[ClsDesc]) = {
         val ValDef(mod, name, tpt, rhs) = fieldTree
-        if (reservedNames.exists(_ == name.decoded))
+        if (reservedNames.exists(_ == name.decoded)) {
           c.abort(c.enclosingPosition, s"Column with name ${name.decoded} not allowed")
-        else {
+        } else {
           val flags = Set[FieldFlag]()
           val annotation = mod.annotations.headOption.map(_.children.head.toString)
           var colType: String = null
@@ -430,6 +435,13 @@ object ModelMacro {
               }
           }
 
+          def defaultValue(valDef: ValDef): Option[String] = {
+            val value = valDef.toString().split(" = ")(1)
+            if (value == "_") None else Some(value)
+          }
+//          println("xxxxxxxx " + clsTree.toString)
+//          println("xxxxxxxx " + fieldTree)
+
           val ClassDef(_, clsName, _, Template(_, _, body)) = clsTree
           body.foreach {
             it =>
@@ -479,7 +491,8 @@ object ModelMacro {
                   }
               }
           }
-          new FldDesc(name.decoded, colName, typeName, flags, Option(colType), onDelete, onUpdate, clsDesc, fieldTree)
+          new FldDesc(name.decoded, colName, typeName, defaultValue(fieldTree),
+            flags, Option(colType), onDelete, onUpdate, clsDesc, fieldTree)
         }
       }
     }
@@ -489,45 +502,47 @@ object ModelMacro {
       if (desc.part) {
         desc.tree.asInstanceOf[ClassDef]
       } else {
-        val valdefs = desc.simpleValDefs.map {
-          it =>
-            if (it.cse) {
-              val tpt = if (it.option) {
-                tq"Option[${typeId(it.typeName)}]"
-              } else {
-                tq"${typeId(it.typeName)}"
-              }
-              val ValDef(mod, nme, _, _) = it.tree
-              val termName = newTermName(nme.decoded + "Id")
-              q"val $termName:$tpt"
-            } else
-              it.tree.asInstanceOf[ValDef]
+        val valdefs = desc.simpleValDefs.map { it =>
+          if (it.cse) {
+            val tpt = if (it.option) {
+              tq"Option[${typeId(it.typeName)}]"
+            } else {
+              tq"${typeId(it.typeName)}"
+            }
+            val ValDef(mod, nme, _, _) = it.tree
+            val termName = newTermName(nme.decoded + "Id")
+            q"val $termName:$tpt"
+          } else {
+            it.tree.asInstanceOf[ValDef]
+          }
         }
         val idTypeName = s"${typeId(desc.name)}"
         val newAttrs = if (augment) idVal(idTypeName) :: valdefs ++ desc.dateVals else valdefs
 
         val xid = q"""def xid = id.getOrElse(throw new Exception("Object has no id yet"))"""
-        val defdefs = desc.foreignKeys.map {
-          it =>
-            if (it.option)
-              q"""def ${newTermName("load" + it.name.capitalize)}(implicit session : JdbcBackend#SessionDef) = ${newTermName(objectName(it.typeName))}.where(_.id === ${newTermName(colIdName(it.name))}).firstOption"""
-            else
-              q"""def ${newTermName("load" + it.name.capitalize)}(implicit session : JdbcBackend#SessionDef) = ${newTermName(objectName(it.typeName))}.where(_.id === ${newTermName(colIdName(it.name))}).first"""
+        val defdefs = desc.foreignKeys.map { it =>
+          if (it.option) {
+            q"""def ${newTermName("load" + it.name.capitalize)}(implicit session : JdbcBackend#SessionDef) = ${newTermName(objectName(it.typeName))}.where(_.id === ${newTermName(colIdName(it.name))}).firstOption"""
+          }
+          else {
+            q"""def ${newTermName("load" + it.name.capitalize)}(implicit session : JdbcBackend#SessionDef) = ${newTermName(objectName(it.typeName))}.where(_.id === ${newTermName(colIdName(it.name))}).first"""
+          }
         }
+
         val one2manyDefs = desc.assocs.map {
           it =>
             q"""
             def ${newTermName("load" + it.name.capitalize)} = for {
-        	  	x <- self.${newTermName(objectName(assocTableName(desc.name, it.typeName)))} if x.${newTermName(colIdName(desc.name))} === id
-        		y <- self.${newTermName(objectName(it.typeName))} if x.${newTermName(colIdName(it.typeName))} === y.id
-        	} yield(y)
+              x <- self.${newTermName(objectName(assocTableName(desc.name, it.typeName)))} if x.${newTermName(colIdName(desc.name))} === id
+              y <- self.${newTermName(objectName(it.typeName))} if x.${newTermName(colIdName(it.typeName))} === y.id
+            } yield(y)
             """
         }
 
-        val one2manyDefAdds = desc.assocs.map {
-          it =>
-            q"""def ${newTermName("add" + it.typeName)}(${newTermName(colIdName(it.typeName))} : ${newTypeName("Long")})(implicit session : JdbcBackend#SessionDef) = ${newTermName(objectName(assocTableName(desc.name, it.typeName)))}.insert(${newTermName(assocTableName(desc.name, it.typeName))}(xid, ${newTermName(colIdName(it.typeName))}))"""
+        val one2manyDefAdds = desc.assocs.map { it =>
+          q"""def ${newTermName("add" + it.typeName)}(${newTermName(colIdName(it.typeName))} : ${newTypeName("Long")})(implicit session : JdbcBackend#SessionDef) = ${newTermName(objectName(assocTableName(desc.name, it.typeName)))}.insert(${newTermName(assocTableName(desc.name, it.typeName))}(xid, ${newTermName(colIdName(it.typeName))}))"""
         }
+
         val lst = if (augment) List(xid) ++ defdefs ++ one2manyDefs ++ one2manyDefAdds else defdefs ++ one2manyDefs ++ one2manyDefAdds
         q"case class ${newTypeName(desc.name)}(..$newAttrs) { ..$lst }"
       }
@@ -803,8 +818,8 @@ object ModelMacro {
           it =>
             new ClsDesc(assocTableName(desc.name, it.typeName), Set(ENTITYDEF),
               ListBuffer(
-                new FldDesc(decapitalize(desc.name), decapitalize(desc.name), desc.name, Set(FieldFlag.CASE), None, "NoAction", "NoAction", Some(desc), ValDef(caseparam, decapitalize(desc.name), null, null)),
-                new FldDesc(decapitalize(it.typeName), decapitalize(it.typeName), it.typeName, Set(FieldFlag.CASE), None, "NoAction", "NoAction", it.cls, ValDef(caseparam, decapitalize(it.typeName), null, null))),
+                new FldDesc(decapitalize(desc.name), decapitalize(desc.name), desc.name, Some("lol"), Set(FieldFlag.CASE), None, "NoAction", "NoAction", Some(desc), ValDef(caseparam, decapitalize(desc.name), null, null)),
+                new FldDesc(decapitalize(it.typeName), decapitalize(it.typeName), it.typeName, None, Set(FieldFlag.CASE), None, "NoAction", "NoAction", it.cls, ValDef(caseparam, decapitalize(it.typeName), null, null))),
               null, plural(decapitalize(assocTableName(desc.name, it.typeName))))
 
         }
